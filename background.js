@@ -23,7 +23,6 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 async function startProcessing(config) {
     let workerTab;
     try {
-        // Create a dedicated worker tab
         workerTab = await chrome.tabs.create({ url: 'about:blank', active: false });
 
         for (let i = 0; i < config.pagesToProcess; i++) {
@@ -32,7 +31,6 @@ async function startProcessing(config) {
             const currentPage = i + 1;
             let pageUrl = config.startUrl;
             if (currentPage > 1) {
-                // Remove existing page parameter if it exists
                 pageUrl = pageUrl.replace(/&?page=\d+/, '');
                 if (pageUrl.includes('?')) {
                     pageUrl += `&page=${currentPage}`;
@@ -43,32 +41,17 @@ async function startProcessing(config) {
             
             updateStatus(`Strona ${currentPage}/${config.pagesToProcess} - Nawigowanie do listy...`);
             
-            // Navigate the worker tab and wait for it to load completely
             await chrome.tabs.update(workerTab.id, { url: pageUrl });
-            await new Promise((resolve, reject) => {
-                const listener = (tabId, changeInfo, tab) => {
-                    if (tabId === workerTab.id && changeInfo.status === 'complete') {
-                        // Check if the tab didn't crash
-                        if (tab.status === 'complete') {
-                             chrome.tabs.onUpdated.removeListener(listener);
-                             resolve();
-                        } else {
-                             chrome.tabs.onUpdated.removeListener(listener);
-                             reject(new Error("Karta uległa awarii podczas ładowania."));
-                        }
-                    }
-                };
-                chrome.tabs.onUpdated.addListener(listener);
-            });
-            await new Promise(r => setTimeout(r, 2000)); // Extra wait for dynamic content
+            await waitForTabLoad(workerTab.id);
+            await new Promise(r => setTimeout(r, 2000));
 
             updateStatus(`Strona ${currentPage}/${config.pagesToProcess} - Pobieranie linków...`);
             const adLinks = await getLinksFromPage(workerTab.id);
 
             if (adLinks.length === 0) {
-                 updateStatus(`Strona ${currentPage}/${config.pagesToProcess} - Nie znaleziono linków. Sprawdź link lub selektory.`, true);
-                 await new Promise(r => setTimeout(r, 3000)); // wait for user to read
-                 continue; // Try next page
+                 updateStatus(`Strona ${currentPage}/${config.pagesToProcess} - Nie znaleziono linków.`, true);
+                 await new Promise(r => setTimeout(r, 3000));
+                 continue;
             }
 
             for (let j = 0; j < adLinks.length; j++) {
@@ -81,7 +64,7 @@ async function startProcessing(config) {
         updateStatus(`Krytyczny błąd: ${error.message}`, true);
     } finally {
         if (workerTab) {
-            chrome.tabs.remove(workerTab.id);
+            try { await chrome.tabs.remove(workerTab.id); } catch(e) {}
         }
         
         if (stopFlag) {
@@ -96,6 +79,21 @@ async function startProcessing(config) {
     }
 }
 
+async function waitForTabLoad(tabId) {
+    return new Promise((resolve, reject) => {
+        const listener = (updatedTabId, changeInfo, tab) => {
+            if (updatedTabId === tabId && changeInfo.status === 'complete') {
+                chrome.tabs.onUpdated.removeListener(listener);
+                if (tab.status === 'complete') {
+                    resolve();
+                } else {
+                    reject(new Error("Karta uległa awarii podczas ładowania."));
+                }
+            }
+        };
+        chrome.tabs.onUpdated.addListener(listener);
+    });
+}
 
 function updateStatus(text, isError = false) {
     currentStatus = text;
@@ -108,36 +106,18 @@ function addLog(data) {
 }
 
 function sendMessageToPopup(message) {
-    // Send to popup
     chrome.runtime.sendMessage(message).catch(err => {});
-    // Also send to any other open extension pages (like options page if you add one)
-    chrome.tabs.query({ url: chrome.runtime.getURL('*.html') }, tabs => {
-        tabs.forEach(tab => {
-            chrome.tabs.sendMessage(tab.id, message).catch(err => {});
-        });
-    });
 }
 
-
 async function getLinksFromPage(tabId) {
-    if (!tabId) throw new Error("Nie podano ID karty roboczej.");
-
     try {
         const results = await chrome.scripting.executeScript({
             target: { tabId: tabId },
-            func: () => {
-                const links = Array.from(document.querySelectorAll('a[data-cy="listing-item-link"]'));
-                return links.map(a => a.href);
-            },
+            func: () => Array.from(document.querySelectorAll('a[data-cy="listing-item-link"]')).map(a => a.href),
         });
-        
-        if (!results || results.length === 0 || !results[0].result) {
-            return [];
-        }
-        return results[0].result;
+        return (results && results[0] && results[0].result) ? results[0].result : [];
     } catch (e) {
-        console.error("Error in getLinksFromPage:", e);
-        throw new Error(`Nie udało się wykonać skryptu na stronie: ${e.message}`);
+        throw new Error(`Nie udało się wykonać skryptu na stronie listy: ${e.message}`);
     }
 }
 
@@ -145,72 +125,55 @@ async function processSingleAd(url, formData) {
     let adTab;
     try {
         adTab = await chrome.tabs.create({ url, active: false });
-        await new Promise((resolve, reject) => {
-            const listener = (tabId, changeInfo, tab) => {
-                 if (tabId === adTab.id && changeInfo.status === 'complete') {
-                    chrome.tabs.onUpdated.removeListener(listener);
-                    if (tab.status === 'complete') {
-                        resolve();
-                    } else {
-                        reject(new Error("Karta ogłoszenia uległa awarii."));
-                    }
-                }
-            };
-            chrome.tabs.onUpdated.addListener(listener);
-        });
-        
+        await waitForTabLoad(adTab.id);
         await new Promise(r => setTimeout(r, 2000));
 
         const results = await chrome.scripting.executeScript({
             target: { tabId: adTab.id },
-            func: (formData, processedContactsArray) => {
+            func: async (formData, processedContactsArray) => {
                 const processed = new Set(processedContactsArray);
                 let userName = 'Nieznany';
                 let userPhone = 'Nieznany';
 
                 try {
-                    const userNameEl = document.querySelector('[data-cy="advertiser-card-name"]');
-                    if (!userNameEl) throw new Error("Nie znaleziono nazwy agencji.");
+                    // --- NEW, UPDATED SELECTORS BASED ON SCREENSHOT ---
+                    const userNameEl = document.querySelector('h2[data-testid="aside-author-name"] a');
+                    const phoneEl = document.querySelector('a[data-testid="aside-author-phone-number"]');
+                    
+                    if (!userNameEl) throw new Error("Nie znaleziono nazwy użytkownika (nowy selektor).");
                     userName = userNameEl.textContent.trim();
 
-                    const phoneButton = document.querySelector('[data-cy="ask-about-number"]');
-                    if (!phoneButton) throw new Error("Nie znaleziono przycisku Pokaż numer.");
-                    phoneButton.click();
+                    if (!phoneEl) throw new Error("Nie znaleziono numeru telefonu (prawdopodobnie ukryty lub brak).");
+                    userPhone = phoneEl.href.replace('tel:', '').trim();
+                    // --- END OF NEW SELECTORS ---
+
+                    const contactKey = `${userName}-${userPhone}`;
+                    if (processed.has(contactKey)) {
+                        return { status: 'skipped', userName, userPhone };
+                    }
                     
-                    return new Promise(resolve => {
-                         setTimeout(() => {
-                            try {
-                                const phoneEl = document.querySelector('a[href^="tel:"]');
-                                if (!phoneEl) throw new Error("Nie znaleziono numeru telefonu po kliknięciu.");
-                                userPhone = phoneEl.textContent.trim();
+                    // Clear the default message first
+                    const messageTextarea = document.querySelector('#message');
+                    if (!messageTextarea) throw new Error("Nie znaleziono pola wiadomości.");
+                    messageTextarea.value = ''; // Clear content
 
-                                const contactKey = `${userName}-${userPhone}`;
-                                if (processed.has(contactKey)) {
-                                    resolve({ status: 'skipped', userName, userPhone });
-                                    return;
-                                }
+                    // Fill the form
+                    document.querySelector('#name').value = formData.name;
+                    document.querySelector('#email').value = formData.email;
+                    document.querySelector('#phone').value = formData.phone;
+                    messageTextarea.value = formData.message;
+                    
+                    const checkbox = document.querySelector('input[name="rules_confirmation-aside"] + label');
+                    if (!checkbox) throw new Error("Nie znaleziono checkboxa zgody.");
+                    checkbox.click();
 
-                                document.querySelector('#name').value = formData.name;
-                                document.querySelector('#email').value = formData.email;
-                                document.querySelector('#phone').value = formData.phone;
-                                document.querySelector('#message').value = formData.message;
-                                
-                                const checkbox = document.querySelector('input[name="rules_confirmation"] + label');
-                                if (!checkbox) throw new Error("Nie znaleziono checkboxa zgody.");
-                                checkbox.click();
-
-                                // FAKTYCZNA WYSYŁKA - ODKOMENTUJ ABY WŁĄCZYĆ
-                                // document.querySelector('button[data-cy="contact-form-send-button"]').click();
-                                
-                                resolve({ status: 'success', userName, userPhone });
-                            } catch (e) {
-                                resolve({ status: 'error', error: e.message, userName, userPhone: 'Błąd' });
-                            }
-                        }, 1000); // Czekaj na numer
-                    });
+                    // FAKTYCZNA WYSYŁKA - ODKOMENTUJ ABY WŁĄCZYĆ
+                    // document.querySelector('button[data-testid="contact-form-send-button"]').click();
+                    
+                    return { status: 'success', userName, userPhone };
 
                 } catch (e) {
-                    return { status: 'error', error: e.message, userName, userPhone: 'Błąd' };
+                    return { status: 'error', error: e.message, userName: userName || 'Nieznany', userPhone: 'Błąd' };
                 }
             },
             args: [formData, Array.from(processedContacts)]
@@ -221,21 +184,17 @@ async function processSingleAd(url, formData) {
         }
 
         const result = results[0].result;
-        if (result.status === 'success') {
+        if (result.status === 'success' || (result.status === 'skipped' && result.userPhone !== 'Błąd')) {
             const contactKey = `${result.userName}-${result.userPhone}`;
             processedContacts.add(contactKey);
         }
         addLog(result);
 
     } catch (error) {
-        addLog({ status: 'error', userName: 'Błąd', error: `Błąd przetwarzania karty: ${error.message}` });
+        addLog({ status: 'error', userName: 'Błąd Krytyczny', error: `Błąd przetwarzania karty: ${error.message}` });
     } finally {
         if (adTab) {
-            try {
-                await chrome.tabs.remove(adTab.id);
-            } catch(e) {
-                console.warn(`Could not remove tab ${adTab.id}: ${e.message}`);
-            }
+            try { await chrome.tabs.remove(adTab.id); } catch(e) {}
         }
     }
 }
